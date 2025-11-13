@@ -1,0 +1,51 @@
+def infer(self, x, x_lengths, sid=None, noise_scale=1, length_scale=1, noise_scale_w=1.0, max_len=None, target_indices=None, hps=None ):
+    from text.symbols import symbols
+    from text import text_to_sequence
+    
+    #encoder
+    x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
+
+    #speaker embedding
+    if self.n_speakers > 0:
+      g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
+    else:
+      g = None
+    
+    # ---------- Decode phonemes ----------
+    _id_to_symbol = {i: s for i, s in enumerate(symbols)}
+    x_ids = x.squeeze(0).long().cpu().numpy().flatten()
+
+    # Only keep valid indices
+    decoded_phonemes = [_id_to_symbol[i] for i in x_ids if i in _id_to_symbol]
+    decoded_phonemes = [p for p in decoded_phonemes if p.strip() not in ["", " "]]
+    # ---------- Duration predictor ----------
+    if self.use_sdp:
+      logw = self.dp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
+    else:
+      logw = self.dp(x, x_mask, g=g)
+    print("logw:",logw)
+    print("after multiplying with x_mask:",torch.exp(logw) * x_mask)
+    # ---------- Find target phoneme indices ----------
+    
+    #awesome_phoneme_indices = [15, 17, 19, 21, 23, 25]
+      # ---------- Adjust durations ----------
+    w = torch.exp(logw) * x_mask * length_scale
+    # ---------- Adjust durations for target phonemes ----------
+    if target_indices is not None and len(target_indices) > 0:
+        for idx in target_indices:
+            w[:, :, idx] *= 0.5
+    print("w",w)
+    w_ceil = torch.ceil(w)
+    print("w_ceil:",w_ceil)  
+    y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
+    y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(x_mask.dtype)
+    attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
+    attn = commons.generate_path(w_ceil, attn_mask)
+
+    m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2) # [b, t', t], [b, t, d] -> [b, d, t']
+    logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2) # [b, t', t], [b, t, d] -> [b, d, t']
+
+    z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
+    z = self.flow(z_p, y_mask, g=g, reverse=True)
+    o = self.dec((z * y_mask)[:,:,:max_len], g=g)
+    return o, attn, y_mask, (z, z_p, m_p, logs_p)
